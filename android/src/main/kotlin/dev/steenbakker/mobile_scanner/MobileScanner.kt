@@ -71,12 +71,14 @@ class MobileScanner(
     private var camera: Camera? = null
     private var cameraSelector: CameraSelector? = null
     private var preview: Preview? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private var surfaceProducer: TextureRegistry.SurfaceProducer? = null
     private var scanner: BarcodeScanner? = null
     private var lastScanned: List<String?>? = null
     private var scannerTimeout = false
     private var displayListener: DisplayManager.DisplayListener? = null
     private var analysisExecutor = Executors.newSingleThreadExecutor()
+    private var cameraLifecycleOwner: CameraLifecycleOwner? = null
 
     /// Configurable variables
     var scanWindow: List<Float>? = null
@@ -368,27 +370,42 @@ class MobileScanner(
         this.returnImage = returnImage
         this.invertImage = invertImage
 
-        if (camera?.cameraInfo != null && preview != null && surfaceProducer != null && !isPaused) {
+        // Resume from pause: just restart the camera lifecycle (no surface recreation)
+        if (isPaused) {
+            resumeCamera()
+            deviceOrientationListener.start()
 
-// TODO: resume here for seamless transition
-//            if (isPaused) {
-//                resumeCamera()
-//                val cameraDirection = getCameraLensFacing(camera)
-//                mobileScannerStartedCallback(
-//                  MobileScannerStartParameters(
-//                    if (portrait) width else height,
-//                    if (portrait) height else width,
-//                    deviceOrientationListener.getOrientation().serialize(),
-//                    sensorRotationDegrees,
-//                    surfaceProducer!!.handlesCropAndRotation(),
-//                    currentTorchState,
-//                    surfaceProducer!!.id(),
-//                    numberOfCameras ?: 0,
-//                    cameraDirection
-//                  )
-//                )
-//                return
-//            }
+            val resolution = imageAnalysis?.resolutionInfo?.resolution
+            val width = resolution?.width?.toDouble() ?: 0.0
+            val height = resolution?.height?.toDouble() ?: 0.0
+            val sensorRotationDegrees = camera?.cameraInfo?.sensorRotationDegrees ?: 0
+            val portrait = sensorRotationDegrees % 180 == 0
+            val cameraDirection = getCameraLensFacing(camera)
+            val numberOfCameras = cameraProvider?.availableCameraInfos?.size
+
+            var currentTorchState: Int = -1
+            camera?.cameraInfo?.let {
+                if (!it.hasFlashUnit()) return@let
+                currentTorchState = it.torchState.value ?: -1
+            }
+
+            mobileScannerStartedCallback(
+                MobileScannerStartParameters(
+                    if (portrait) width else height,
+                    if (portrait) height else width,
+                    deviceOrientationListener.getOrientation().serialize(),
+                    sensorRotationDegrees,
+                    surfaceProducer!!.handlesCropAndRotation(),
+                    currentTorchState,
+                    surfaceProducer!!.id(),
+                    numberOfCameras ?: 0,
+                    cameraDirection,
+                )
+            )
+            return
+        }
+
+        if (camera?.cameraInfo != null && preview != null && surfaceProducer != null) {
             mobileScannerErrorCallback(AlreadyStarted())
 
             return
@@ -460,10 +477,17 @@ class MobileScanner(
             }
 
             val analysis = analysisBuilder.build().apply { setAnalyzer(analysisExecutor, captureOutput) }
+            imageAnalysis = analysis
+
+            // Create a custom lifecycle owner to control the camera independently.
+            // This allows pause/resume via lifecycle transitions instead of unbind/rebind,
+            // which preserves the Surface and avoids "Surface was abandoned" errors.
+            cameraLifecycleOwner = CameraLifecycleOwner()
+            cameraLifecycleOwner!!.bind(activity as LifecycleOwner)
 
             try {
                 camera = cameraProvider?.bindToLifecycle(
-                    activity as LifecycleOwner,
+                    cameraLifecycleOwner!!,
                     cameraPosition,
                     preview,
                     analysis
@@ -477,13 +501,13 @@ class MobileScanner(
 
             camera?.let {
                 // Register the torch listener
-                it.cameraInfo.torchState.observe(activity as LifecycleOwner) { state ->
+                it.cameraInfo.torchState.observe(cameraLifecycleOwner!!) { state ->
                     // TorchState.OFF = 0; TorchState.ON = 1
                     torchStateCallback(state)
                 }
 
                 // Register the zoom scale listener
-                it.cameraInfo.zoomState.observe(activity) { state ->
+                it.cameraInfo.zoomState.observe(cameraLifecycleOwner!!) { state ->
                     zoomScaleStateCallback(state.linearZoom.toDouble())
                 }
 
@@ -575,19 +599,20 @@ class MobileScanner(
     }
 
     private fun pauseCamera() {
-        // Pause camera by unbinding all use cases
-        cameraProvider?.unbindAll()
+        // Transition the lifecycle to CREATED: CameraX stops the capture session
+        // but keeps use cases bound and the surface alive (last frame stays visible).
+        cameraLifecycleOwner?.pause()
         isPaused = true
     }
 
-//    private fun resumeCamera() {
-//        // Resume camera by rebinding use cases
-//        cameraProvider?.let { provider ->
-//            val owner = activity as LifecycleOwner
-//            cameraSelector?.let { provider.bindToLifecycle(owner, it, preview) }
-//        }
-//        isPaused = false
-//    }
+    private fun resumeCamera() {
+        // Transition the lifecycle back to RESUMED: CameraX restarts the capture session
+        // with the same use cases and surface (seamless, no flicker).
+        cameraLifecycleOwner?.resume()
+        lastScanned = null
+        scannerTimeout = false
+        isPaused = false
+    }
 
     private fun releaseCamera() {
         if (displayListener != null) {
@@ -597,17 +622,17 @@ class MobileScanner(
             displayListener = null
         }
 
-        val owner = activity as LifecycleOwner
-        // Release the camera observers first.
-        camera?.cameraInfo?.let {
-            it.torchState.removeObservers(owner)
-            it.zoomState.removeObservers(owner)
-            it.cameraState.removeObservers(owner)
-        }
+        // Destroy the camera lifecycle (unbinds all use cases and cleans up observers).
+        cameraLifecycleOwner?.unbind(activity as LifecycleOwner)
+        cameraLifecycleOwner = null
 
-        // Unbind the camera use cases, the preview is a use case.
-        // The camera will be closed when the last use case is unbound.
+        // Unbind any remaining use cases.
         cameraProvider?.unbindAll()
+        isPaused = false
+
+        camera = null
+        preview = null
+        imageAnalysis = null
 
         // Release the surface for the preview.
         surfaceProducer?.release()
